@@ -103,6 +103,15 @@ def ensure_results_dirs():
         os.makedirs(path, exist_ok=True)
 
 
+def open_results_folder():
+    ensure_results_dirs()
+    results_path = os.path.abspath('results')
+    if os.name == 'nt':
+        os.startfile(results_path)
+    else:
+        subprocess.Popen(['xdg-open', results_path])
+
+
 def read_lines(path):
     if not os.path.exists(path):
         return []
@@ -561,19 +570,20 @@ def _run_threaded(fn, stop_event, status_var, all_btns, start_btn, stop_btn, lab
     stop_btn.config(state='normal')
     status_var.set(label)
 
-    def _restore():
+    def _restore(final_status='Ready'):
         for button in all_btns:
             button.config(state='normal')
         stop_btn.config(state='disabled')
-        status_var.set('Ready')
+        status_var.set(final_status)
 
     def _run():
+        final_status = 'Ready'
         try:
             fn(*args, stop_event=stop_event)
         except Exception as exc:
-            root.after(0, lambda: status_var.set(f'Error: {exc}'))
+            final_status = f'Error: {exc}'
         finally:
-            root.after(0, _restore)
+            root.after(0, _restore, final_status)
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -846,7 +856,7 @@ def main():
     tk.Button(
         util_frame,
         text='Open Results',
-        command=lambda: (ensure_results_dirs(), subprocess.Popen(['xdg-open', 'results'])),
+        command=open_results_folder,
         font=('Helvetica', 11),
         bg='#2B2B35',
         fg='#C9CBFF',
