@@ -1,6 +1,1 @@
-os
-re
-subprocess
-threading
-tk
-Pillow
+Pillow>=9.1

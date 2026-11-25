@@ -36,23 +36,24 @@
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/capture0x/Bug-Hunter.git
-   cd Bug-Hunter
-   
-2. Install dependencies:
-   - **Ensure Python 3.x is installed.**
-   - **Install required Python packages**:
-     ```bash
-     pip install -r requirements.txt
-     chmod +x install.sh
-     bash install.sh
-  - **Install additional tools like** `subfinder`, `assetfinder`, `ffuf`, `httpx`, and `ParamSpider`
-#### :warning: Important
-
-**Do not forget to run the `install.sh` script! This step is crucial to set up the environment correctly.**
-
+   git clone https://github.com/maxzysparks/bughunter.git
+   cd bughunter
+   ```
+2. Run the installer (installs Pillow and the Go-based tools, and reports anything missing):
+   ```bash
+   bash install.sh
+   ```
+   - Python 3.9+ and **tkinter** are required (`sudo apt install python3-tk` on Debian/Ubuntu/Kali).
+   - On systems with an externally-managed Python (Ubuntu 24, Kali), use a virtualenv:
+     `python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt`
+   - Install `ffuf`, `ParamSpider`, and optionally `findomain` / `amass` manually.
 3. Run the application:
-    `python3 bug.py`
+   ```bash
+   python3 bug.py
+   ```
+
+> **Windows:** the Go tools run natively, but use WSL for the best experience.
+
 ## 🕹️ Usage
 
 1. **Launch the application** using the command above.
@@ -69,7 +70,7 @@
 
 ### Directory Scanning
 - **Perform directory brute-forcing**.
-- **Save results** with relevant HTTP status codes.
+- **Save results** with relevant HTTP status codes (ffuf auto-calibration is on to cut false positives).
 
 ### Parameter Extraction
 - **Extract and analyze** URL parameters.
@@ -82,22 +83,15 @@
 
 ## 💾 Dependencies
 
-- **Python 3.x**
-- **Tools**:
-  - `subfinder`
-  - `assetfinder`
-  - `httpx`
-  - `ffuf`
-  - `ParamSpider`
-- **APIs**:
-  - `Certspotter`
-  - `crt.sh`
-- **Libraries**:
-  - `PIL` (for image handling)
-  - `Tkinter` (for GUI)
-  - `subprocess`
-  - `threading`
-  - `re`
+- **Python 3.9+**, `Pillow`, `tkinter`
+- **Required tools**: `httpx` (ProjectDiscovery), `ffuf`, `ParamSpider`, `waybackurls`, `kxss`, `nuclei`
+- **Optional tools**: `subfinder`, `findomain`, `amass`
+- **Passive sources** (queried from Python, no curl/jq needed): crt.sh, Certspotter, HackerTarget, OTX, subdomain.center, RapidDNS
+
+## 📁 Results
+
+Results are stored per target in `results/<domain>/` (subdomains, directory, paramspider, xss, nuclei, `FINAL_REPORT.txt`), so scans of different targets never mix. Use this tool only on targets you are authorised to test.
+
 ## 📷 Screenshots
 
 <img src="https://raw.githubusercontent.com/capture0x/Bug-Hunter/refs/heads/main/screenshots/1.png" width="32%"></img>
