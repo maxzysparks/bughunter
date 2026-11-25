@@ -559,9 +559,9 @@ def start_nuclei_scan(domain, stop_event, status_var, all_btns, stop_btn, root):
 def main():
     root = tk.Tk()
     root.title('Bug Hunter GUI')
-    root.geometry('1000x1000')
+    root.geometry('1000x820')
     root.configure(bg='#1E1E2E')
-    root.minsize(800, 700)
+    root.minsize(800, 650)
 
     stop_event = threading.Event()
     wordlist_var = tk.StringVar(value='common.txt')
@@ -656,7 +656,7 @@ def main():
         root,
         wrap=tk.WORD,
         width=90,
-        height=20,
+        height=14,
         bg='#2B2B35',
         fg='#00FF00',
         insertbackground='white',
