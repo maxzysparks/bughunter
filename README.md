@@ -2,12 +2,12 @@
 
 **Bug Hunter** is a comprehensive and advanced tool tailored for bug bounty hunters, offering streamlined subdomain discovery, directory scanning, parameter extraction, and vulnerability detection. With its intuitive GUI, Bug Hunter integrates various tools and techniques to provide a seamless and efficient bug-hunting experience.
 
-<img src="https://raw.githubusercontent.com/capture0x/Bug-Hunter/refs/heads/main/screenshots/11.png" width="100%"></img>
+<img src="https://raw.githubusercontent.com/maxzysparks/bughunter/main/screenshots/11.png" width="100%"></img>
 
 ## ⚙️ Features 
 
 ### ✅ Subdomain Discovery
-- **Automated Scanning**: Leverages tools like `subfinder`, `assetfinder`, and APIs such as `Certspotter` and `crt.sh` to discover subdomains.
+- **Automated Scanning**: Leverages tools like `subfinder`, `findomain`, `amass`, and APIs such as `Certspotter` and `crt.sh` to discover subdomains.
 - **Validation**: Filters and validates subdomains using `httpx` to identify live targets.
 
 ### ✅ Directory Scanning
@@ -34,12 +34,13 @@
 
 ## 💻 Installation
 
+### Linux / macOS / WSL
 1. Clone this repository:
    ```bash
    git clone https://github.com/maxzysparks/bughunter.git
    cd bughunter
    ```
-2. Run the installer (installs Pillow and the Go-based tools, and reports anything missing):
+2. Run the installer:
    ```bash
    bash install.sh
    ```
@@ -47,12 +48,30 @@
    - On systems with an externally-managed Python (Ubuntu 24, Kali), use a virtualenv:
      `python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt`
    - Install `ffuf`, `ParamSpider`, and optionally `findomain` / `amass` manually.
-3. Run the application:
+3. Run:
    ```bash
    python3 bug.py
    ```
 
-> **Windows:** the Go tools run natively, but use WSL for the best experience.
+### Windows (native)
+1. Install [Python 3.9+](https://www.python.org/downloads/) — **check** “tcl/tk and IDLE” and “Add python.exe to PATH”.
+2. Install [Go](https://go.dev/dl/) (needed for the ProjectDiscovery tools).
+3. Clone the repo and open PowerShell in the folder:
+   ```powershell
+   git clone https://github.com/maxzysparks/bughunter.git
+   cd bughunter
+   Set-ExecutionPolicy -Scope Process Bypass
+   .\install.ps1
+   ```
+4. Manually install (if the script reports them missing):
+   - **ffuf**: download the Windows zip from [ffuf releases](https://github.com/ffuf/ffuf/releases) and put `ffuf.exe` on your PATH.
+   - **ParamSpider**: `pip install paramspider`
+5. Run:
+   ```powershell
+   python bug.py
+   ```
+
+> **Tip:** WSL2 (Ubuntu) is still the smoothest experience if you prefer the Linux workflow.
 
 ## 🕹️ Usage
 
@@ -60,7 +79,7 @@
 2. **Enter the target domain** in the input field.
 3. **Click "Start Full Scan"** to initiate the scanning process.
 4. **Monitor real-time results** in the GUI.
-5. **Access saved results** in the `results` directory.
+5. **Access saved results** in the `results` directory (or click “Open Results”).
 
 ## 🔋 Workflow
 
@@ -94,12 +113,12 @@ Results are stored per target in `results/<domain>/` (subdomains, directory, par
 
 ## 📷 Screenshots
 
-<img src="https://raw.githubusercontent.com/capture0x/Bug-Hunter/refs/heads/main/screenshots/1.png" width="32%"></img>
-<img src="https://raw.githubusercontent.com/capture0x/Bug-Hunter/refs/heads/main/screenshots/2.png" width="32%"></img>
-<img src="https://raw.githubusercontent.com/capture0x/Bug-Hunter/refs/heads/main/screenshots/3.png" width="32%"></img>
-<img src="https://raw.githubusercontent.com/capture0x/Bug-Hunter/refs/heads/main/screenshots/4.png" width="32%"></img>
-<img src="https://raw.githubusercontent.com/capture0x/Bug-Hunter/refs/heads/main/screenshots/5.png" width="32%"></img>
-<img src="https://raw.githubusercontent.com/capture0x/Bug-Hunter/refs/heads/main/screenshots/7.png" width="32%"></img>
+<img src="https://raw.githubusercontent.com/maxzysparks/bughunter/main/screenshots/1.png" width="32%"></img>
+<img src="https://raw.githubusercontent.com/maxzysparks/bughunter/main/screenshots/2.png" width="32%"></img>
+<img src="https://raw.githubusercontent.com/maxzysparks/bughunter/main/screenshots/3.png" width="32%"></img>
+<img src="https://raw.githubusercontent.com/maxzysparks/bughunter/main/screenshots/4.png" width="32%"></img>
+<img src="https://raw.githubusercontent.com/maxzysparks/bughunter/main/screenshots/5.png" width="32%"></img>
+<img src="https://raw.githubusercontent.com/maxzysparks/bughunter/main/screenshots/7.png" width="32%"></img>
 
 ## 🤖 Contributing
 
@@ -114,4 +133,3 @@ You can view the full license details [here](https://www.gnu.org/licenses/gpl-3.
 ## 🪄 Author
 
 Developed with passion by **Tmrswrr**.
-
