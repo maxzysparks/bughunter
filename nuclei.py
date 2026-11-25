@@ -1,104 +1,90 @@
 import os
-import re
-import shlex
-import signal
-import subprocess
+import tempfile
 
-_ANSI_RE = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F][@-_])[0-?]*[ -/]*[@-~]')
-_MULTI_NL = re.compile(r'\n+')
+from core import (
+    BASE_DIR,
+    base_url_for,
+    ensure_results_dirs,
+    load_probe_urls,
+    normalize_domain,
+    quote,
+    read_lines,
+    reset_dir,
+    stream_command,
+    target_dir,
+    tool_exists,
+)
 
 
-def _clean(text):
-    return _MULTI_NL.sub('\n', _ANSI_RE.sub('', text)).strip()
-
-
-def _kill(process):
-    try:
-        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-    except Exception:
-        try:
-            process.terminate()
-        except Exception:
-            pass
+def _default_templates():
+    local = os.path.join(BASE_DIR, 'nuclei-templates')
+    return local if os.path.isdir(local) else None  # None => nuclei's own managed templates
 
 
 def run_nuclei_scan(domain, log, stop_event=None, template=None):
-    out_dir = os.path.join('results', 'nuclei')
-    os.makedirs(out_dir, exist_ok=True)
+    domain = normalize_domain(domain)
+    ensure_results_dirs(domain)
+    out_dir = target_dir(domain, 'nuclei')
+    reset_dir(out_dir)
     out_file = os.path.join(out_dir, 'nuclei.txt')
-    templates = template or 'nuclei-templates/'
 
+    if not tool_exists('nuclei'):
+        log('[-] nuclei is not installed (run install.sh).', 'red')
+        return
+
+    subdomains = read_lines(target_dir(domain, 'subdomains.txt'))
+    if not subdomains:
+        log(f'[-] No live subdomains for {domain}. Run the subdomain scan first.', 'red')
+        return
+
+    templates = template or _default_templates()
+    if templates and not os.path.exists(templates):
+        log(f'[-] Nuclei templates not found: {templates}', 'red')
+        return
+
+    probe = load_probe_urls(domain)
+    targets = [base_url_for(domain, host, probe) for host in subdomains]
+
+    url_list = os.path.join(tempfile.gettempdir(), f'bughunter_nuclei_{os.getpid()}.txt')
     try:
-        subs_path = os.path.join('results', 'subdomains.txt')
-        if not os.path.exists(subs_path):
-            log('[-] results/subdomains.txt not found. Run subdomain scan first.', 'red')
-            return
-
-        with open(subs_path, encoding='utf-8', errors='ignore') as handle:
-            subdomains = [line.strip() for line in handle if line.strip()]
-
-        if not subdomains:
-            log('[!] subdomains.txt is empty.', 'red')
-            return
-
-        if not os.path.exists(templates):
-            log(f'[-] Nuclei templates not found: {templates}', 'red')
-            log('[*] git clone https://github.com/projectdiscovery/nuclei-templates.git', 'default')
-            return
-
-        url_list = os.path.join(out_dir, '.urls.txt')
         with open(url_list, 'w', encoding='utf-8') as handle:
-            for host in subdomains:
-                handle.write(host if host.startswith(('http://', 'https://')) else 'https://' + host)
-                handle.write('\n')
+            handle.write('\n'.join(targets) + '\n')
 
-        log(f'[*] Nuclei scan on {len(subdomains)} subdomains (this can take a while)...', 'default')
-        cmd = (
-            f"nuclei -l {shlex.quote(url_list)} "
-            f"-t {shlex.quote(templates)} "
-            f"-severity low,medium,high,critical "
-            f"-rate-limit 150 -timeout 8 -retries 1 -silent -nc"
-        )
+        cmd = f'nuclei -l {quote(url_list)} '
+        if templates:
+            cmd += f'-t {quote(templates)} '
+        cmd += '-severity low,medium,high,critical -rate-limit 150 -timeout 8 -retries 1 -silent -nc'
 
-        proc = subprocess.Popen(
-            cmd,
-            shell=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
-        )
-
+        log(f'[*] Nuclei scan on {len(targets)} targets (this can take a while)...', 'default')
         findings = 0
         with open(out_file, 'w', encoding='utf-8') as outf:
-            outf.write(f'# Nuclei scan: {domain}\n')
-            outf.write(f'# Total targets: {len(subdomains)}\n\n')
-            try:
-                while True:
-                    if stop_event and stop_event.is_set():
-                        _kill(proc)
-                        log('[-] Nuclei scan stopped.', 'red')
-                        return
-                    line = proc.stdout.readline()
-                    if not line and proc.poll() is not None:
-                        break
-                    if line:
-                        cleaned = _clean(line)
-                        if cleaned:
-                            outf.write(cleaned + '\n')
-                            log(cleaned, 'default')
-                            findings += 1
-            finally:
-                proc.wait()
+            outf.write(f'# Nuclei scan: {domain}\n# Total targets: {len(targets)}\n\n')
 
+            def _finding(line):
+                nonlocal findings
+                outf.write(line + '\n')
+                log(line, 'default')
+                findings += 1  # stdout only: stderr noise is not a finding
+
+            result = stream_command(
+                cmd,
+                on_stdout=_finding,
+                on_stderr=lambda line: log(f'[nuclei] {line}', 'default'),
+                stop_event=stop_event,
+            )
+
+        if result.stopped:
+            log('[-] Nuclei scan stopped.', 'red')
+        elif not result.ok:
+            log(f'[-] Nuclei exited with code {result.returncode}.', 'red')
+        elif findings:
+            log(f'[+] Nuclei complete: {findings} findings → {out_file}', 'light_green')
+        else:
+            log('[!] Nuclei found nothing (templates may need updating: nuclei -ut).', 'default')
+    except Exception as exc:
+        log(f'[-] Nuclei error: {exc}', 'red')
+    finally:
         try:
             os.remove(url_list)
         except OSError:
             pass
-
-        if findings:
-            log(f'[+] Nuclei complete: {findings} findings → {out_file}', 'light_green')
-        else:
-            log('[!] Nuclei found nothing (templates may need updating).', 'default')
-    except Exception as exc:
-        log(f'[-] Nuclei error: {exc}', 'red')

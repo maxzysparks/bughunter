@@ -2,662 +2,531 @@ import json
 import os
 import queue
 import re
-import shlex
-import signal
 import subprocess
+import sys
 import tempfile
 import threading
-import time
 import tkinter as tk
-from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from tkinter import filedialog, messagebox, scrolledtext
-from urllib.parse import urlparse
+from urllib.parse import quote as url_quote
 
 from PIL import Image, ImageTk
 
 import xss
+from core import (
+    BASE_DIR,
+    RESULTS_ROOT,
+    HostProbeResult,
+    base_url_for,
+    ensure_results_dirs,
+    extract_host,
+    http_get,
+    is_noise,
+    is_subdomain,
+    load_probe_urls,
+    normalize_domain,
+    parse_probe_line,
+    quote,
+    read_lines,
+    reset_dir,
+    stream_command,
+    target_dir,
+    tool_exists,
+    validate_domain,
+    write_lines,
+)
 from nuclei import run_nuclei_scan
 
-_ANSI_RE = re.compile(r'(?:\x1B[@-_]|[\x80-\x9F][@-_])[0-?]*[ -/]*[@-~]')
-_MULTI_NL = re.compile(r'\n+')
-_DOMAIN_RE = re.compile(r'^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$')
-_URL_RE = re.compile(r'^https?://', re.IGNORECASE)
-_HOST_RE = re.compile(
-    r'^[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?'
-    r'(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*'
-    r'\.[a-zA-Z]{2,}$'
-)
-_NOISE_RE = re.compile(
-    r'^(?:url\d+|em\d+|e\.em\d+|click\d*|track\d*|bounce\d*|pm-bounces|mail\d+|smtp\d+|mta\d+|link\d+|img\d+|rs\d+)\.',
-    re.IGNORECASE,
-)
-_ALLOWED_HTTP_CODES = {200, 204, 301, 302, 307, 308, 401, 403}
-_FINDINGS_CODES = {200, 204, 401, 403}
-_REDIRECT_CODES = {301, 302, 307, 308}
-
 _GOBIN = os.path.join(os.path.expanduser('~'), 'go', 'bin')
-if _GOBIN not in os.environ.get('PATH', ''):
-    os.environ['PATH'] = _GOBIN + os.pathsep + os.environ.get('PATH', '')
+_GO_HTTPX = os.path.join(_GOBIN, 'httpx')
+# ProjectDiscovery httpx lives in ~/go/bin; plain `httpx` may be the unrelated Python CLI.
+_HTTPX = _GO_HTTPX if os.path.isfile(_GO_HTTPX) else 'httpx'
 
-_HTTPX = os.path.join(_GOBIN, 'httpx')
-if not os.path.exists(_HTTPX):
-    _HTTPX = 'httpx'
+FFUF_THREADS = 40
+FFUF_RATE = 150
+FFUF_HOST_TIMEOUT = 900
+PARAMSPIDER_TIMEOUT = 150
+PROBE_TIMEOUT = 900
+MAX_OUTPUT_LINES = 5000
+DRAIN_BATCH = 200
 
 _output_queue = queue.Queue()
 
 
-@dataclass(frozen=True)
-class HostProbeResult:
-    host: str
-    url: str
-    codes: tuple
-    title: str = ''
-
-    @property
-    def primary_code(self):
-        return self.codes[0] if self.codes else None
-
-    @property
-    def is_live(self):
-        return any(code in _ALLOWED_HTTP_CODES for code in self.codes)
-
-
+# --------------------------------------------------------------------------
+# GUI logging
+# --------------------------------------------------------------------------
 def _drain_queue(output_widget, root):
+    drained = False
     try:
-        while True:
+        for _ in range(DRAIN_BATCH):  # bounded so heavy output can't freeze Tk
             text, tag = _output_queue.get_nowait()
             output_widget.insert(tk.END, text, tag)
-            output_widget.yview(tk.END)
+            drained = True
     except queue.Empty:
         pass
-    root.after(100, _drain_queue, output_widget, root)
+    if drained:
+        extra = int(output_widget.index('end-1c').split('.')[0]) - MAX_OUTPUT_LINES
+        if extra > 0:
+            output_widget.delete('1.0', f'{extra + 1}.0')
+        output_widget.yview(tk.END)
+    root.after(50, _drain_queue, output_widget, root)
 
 
 def _log(text, tag='default'):
     _output_queue.put((text + '\n', tag))
 
 
-def sanitize_filename(name):
-    return re.sub(r'[^\w\-.]', '_', name)
-
-
-def clean_output(text):
-    return _MULTI_NL.sub('\n', _ANSI_RE.sub('', text)).strip()
-
-
-def validate_domain(domain):
-    return bool(_DOMAIN_RE.match((domain or '').strip()))
-
-
-def ensure_results_dirs():
-    paths = [
-        'results',
-        os.path.join('results', 'directory'),
-        os.path.join('results', 'paramspider'),
-        os.path.join('results', 'xss'),
-        os.path.join('results', 'nuclei'),
-        os.path.join('results', 'meta'),
-    ]
-    for path in paths:
-        os.makedirs(path, exist_ok=True)
-
-
 def open_results_folder():
-    ensure_results_dirs()
-    results_path = os.path.abspath('results')
-    if os.name == 'nt':
-        os.startfile(results_path)
-    else:
-        subprocess.Popen(['xdg-open', results_path])
-
-
-def read_lines(path):
-    if not os.path.exists(path):
-        return []
-    with open(path, encoding='utf-8', errors='ignore') as handle:
-        return [line.strip() for line in handle if line.strip()]
-
-
-def write_lines(path, lines):
-    with open(path, 'w', encoding='utf-8') as handle:
-        for line in lines:
-            handle.write(str(line).rstrip() + '\n')
-
-
-def _is_subdomain(host, domain):
-    host = host.strip().lower().rstrip('.')
-    domain = domain.strip().lower().rstrip('.')
-    return host == domain or host.endswith('.' + domain)
-
-
-def _is_noise(host):
-    return bool(_NOISE_RE.match(host))
-
-
-def _extract_host(value):
-    value = (value or '').strip().lower().rstrip('.')
-    if not value:
-        return ''
-    if _URL_RE.match(value):
-        try:
-            return (urlparse(value).hostname or '').lower().rstrip('.')
-        except Exception:
-            pass
-        value = re.sub(r'^https?://', '', value, flags=re.IGNORECASE)
-    return value.split('/')[0].split(':')[0].strip().lower().rstrip('.')
-
-
-def _kill_process(process):
+    os.makedirs(RESULTS_ROOT, exist_ok=True)
     try:
-        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        try:
-            process.terminate()
-        except Exception:
-            pass
-
-
-def run_command(command, stop_event=None, show_cmd=True, command_tag='terminal_red', output_tag='default', cwd=None, timeout=None):
-    if show_cmd:
-        _log(f'Running Command: {command}', command_tag)
-    try:
-        process = subprocess.Popen(
-            command,
-            shell=True,
-            text=True,
-            cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
-        )
-        output = []
-        start = time.time()
-        for line in iter(process.stdout.readline, ''):
-            if stop_event and stop_event.is_set():
-                _kill_process(process)
-                break
-            if timeout and (time.time() - start) > timeout:
-                _kill_process(process)
-                _log(f'[-] Command timeout after {timeout}s: {command}', 'red')
-                break
-            if not line:
-                break
-            clean_line = clean_output(line)
-            if clean_line:
-                output.append(clean_line)
-                _log(clean_line, output_tag)
-        process.wait()
-        return output
+        if sys.platform.startswith('win'):
+            os.startfile(RESULTS_ROOT)
+        elif sys.platform == 'darwin':
+            subprocess.Popen(['open', RESULTS_ROOT])
+        else:
+            subprocess.Popen(['xdg-open', RESULTS_ROOT])
     except Exception as exc:
-        _log(f'[-] Command error: {exc}', 'red')
-        return []
+        messagebox.showerror('Error', f'Could not open results folder:\n{exc}')
 
 
-def detect_tool(binary):
-    if os.path.isabs(binary) and os.path.exists(binary):
-        return binary
-    path = shutil_which(binary)
-    return path or binary
+def resolve_path(path):
+    """Relative paths work from any cwd: try as given, then next to this script."""
+    path = (path or '').strip()
+    if not path or os.path.isabs(path) or os.path.exists(path):
+        return path
+    return os.path.join(BASE_DIR, path)
 
 
-def shutil_which(binary):
-    for part in os.environ.get('PATH', '').split(os.pathsep):
-        candidate = os.path.join(part, binary)
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
+def _validated(domain):
+    domain = normalize_domain(domain)
+    if not validate_domain(domain):
+        messagebox.showerror('Error', 'Enter a valid domain, e.g. example.com')
+        return None
+    return domain
 
 
-def tool_exists(binary):
-    resolved = detect_tool(binary)
-    return bool(os.path.isabs(resolved) and os.path.exists(resolved) or shutil_which(binary))
-
-
+# --------------------------------------------------------------------------
+# Subdomain discovery + probing
+# --------------------------------------------------------------------------
 def write_runtime_metadata(domain):
-    ensure_results_dirs()
+    meta_path = target_dir(domain, 'meta', 'runtime.json')
+    tools = ['subfinder', 'findomain', 'amass', 'ffuf', 'paramspider', 'waybackurls', 'kxss', 'nuclei']
     metadata = {
-        'target': domain,
-        'timestamp_utc': datetime.utcnow().isoformat() + 'Z',
-        'httpx_path': _HTTPX,
-        'available_tools': {
-            'subfinder': tool_exists('subfinder'),
-            'findomain': tool_exists('findomain'),
-            'amass': tool_exists('amass'),
-            'httpx': tool_exists('httpx') or os.path.exists(_HTTPX),
-            'ffuf': tool_exists('ffuf'),
-            'paramspider': tool_exists('paramspider'),
-            'waybackurls': tool_exists('waybackurls'),
-            'kxss': tool_exists('kxss'),
-            'qsreplace': tool_exists('qsreplace'),
-            'nuclei': tool_exists('nuclei'),
-        },
+        'domain': domain,
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'tools': {name: tool_exists(name) for name in tools},
+        'httpx': tool_exists(_HTTPX),
     }
-    meta_path = os.path.join('results', 'meta', 'runtime.json')
     with open(meta_path, 'w', encoding='utf-8') as handle:
         json.dump(metadata, handle, indent=2)
     return meta_path
 
 
-def fetch_subdomains(domain, stop_event=None):
-    ensure_results_dirs()
-    domain = domain.strip().lower().rstrip('.')
-    safe = shlex.quote(domain)
-    esc = re.escape(domain)
+def _enc(domain):
+    return url_quote(domain, safe='')
 
+
+def _src_crtsh(domain):
+    data = json.loads(http_get(f'https://crt.sh/?q=%25.{_enc(domain)}&output=json', timeout=30))
+    names = []
+    for item in data:
+        names.extend(str(item.get('name_value', '')).splitlines())
+    return [name.replace('*.', '') for name in names]
+
+
+def _src_certspotter(domain):
+    url = f'https://api.certspotter.com/v1/issuances?domain={_enc(domain)}&include_subdomains=true&expand=dns_names'
+    names = []
+    for item in json.loads(http_get(url)):
+        names.extend(item.get('dns_names', []))
+    return [name.replace('*.', '') for name in names]
+
+
+def _src_hackertarget(domain):
+    text = http_get(f'https://api.hackertarget.com/hostsearch/?q={_enc(domain)}')
+    return [line.split(',')[0] for line in text.splitlines()]  # rate-limit text is rejected later
+
+
+def _src_otx(domain):
+    data = json.loads(http_get(f'https://otx.alienvault.com/api/v1/indicators/domain/{_enc(domain)}/url_list?limit=500&page=1'))
+    return [item.get('hostname', '') for item in data.get('url_list', [])]
+
+
+def _src_subdomain_center(domain):
+    return [str(item) for item in json.loads(http_get(f'https://api.subdomain.center/?domain={_enc(domain)}'))]
+
+
+def _src_rapiddns(domain):
+    html = http_get(f'https://rapiddns.io/subdomain/{_enc(domain)}?full=1', timeout=20)
+    return re.findall(r'<td>([^<]+)</td>', html)
+
+
+def fetch_subdomains(domain, stop_event=None):
+    domain = normalize_domain(domain)
+    ensure_results_dirs(domain)
     meta_path = write_runtime_metadata(domain)
-    _log(f'[*] Runtime metadata saved → {meta_path}', 'default')
+    _log(f'[*] Fetching subdomains for {domain}...', 'stage')
+
+    def _cli(binary, command, timeout):
+        def _run():
+            if not tool_exists(binary):
+                _log(f'  [{binary}] not installed - skipping', 'default')
+                return []
+            out = []
+            stream_command(command, on_stdout=out.append, stop_event=stop_event, timeout=timeout)
+            return out
+        return _run
 
     sources = [
-        ('subfinder', f'timeout 25 subfinder -d {safe} -silent 2>/dev/null'),
-        ('findomain', f'timeout 25 findomain -t {safe} -q 2>/dev/null'),
-        ('crt.sh', f"curl -s --max-time 15 'https://crt.sh/?q=%25.{domain}&output=json' | jq -r '.[].name_value' 2>/dev/null | sed 's/\\*\\.//g' | sort -u"),
-        ('certspotter', f"curl -s --max-time 15 'https://api.certspotter.com/v1/issuances?domain={domain}&include_subdomains=true&expand=dns_names' | jq -r '.[] | .dns_names[]' 2>/dev/null | grep -Po '([a-zA-Z0-9.-]+\\.{esc})' | sort -u"),
-        ('hackertarget', f"curl -s --max-time 15 'https://api.hackertarget.com/hostsearch/?q={domain}' | awk -F',' '{{print $1}}'"),
-        ('otx', f"curl -s --max-time 15 'https://otx.alienvault.com/api/v1/indicators/domain/{domain}/url_list?limit=250&page=1' | jq -r '.url_list[].hostname' 2>/dev/null | sort -u"),
-        ('subdomain.center', f"curl -s --max-time 15 'https://api.subdomain.center/?domain={domain}' | jq -r '.[]' 2>/dev/null | sort -u"),
-        ('rapiddns', f"curl -s --max-time 15 'https://rapiddns.io/subdomain/{domain}?full=1' | grep -oP '(?<=<td>)[^<]+' | grep -E '\\.{esc}$' | sort -u"),
-        ('amass', f'timeout 45 amass enum -passive -d {safe} 2>/dev/null'),
+        ('crt.sh', lambda: _src_crtsh(domain)),
+        ('certspotter', lambda: _src_certspotter(domain)),
+        ('hackertarget', lambda: _src_hackertarget(domain)),
+        ('otx', lambda: _src_otx(domain)),
+        ('subdomain.center', lambda: _src_subdomain_center(domain)),
+        ('rapiddns', lambda: _src_rapiddns(domain)),
+        ('subfinder', _cli('subfinder', f'subfinder -d {quote(domain)} -silent', 25)),
+        ('findomain', _cli('findomain', f'findomain -t {quote(domain)} -q', 25)),
+        ('amass', _cli('amass', f'amass enum -passive -d {quote(domain)}', 45)),
     ]
 
-    raw_hosts = set()
-    lock = threading.Lock()
-    total = len(sources)
+    found, lock = set(), threading.Lock()
 
-    def _run_source(idx, name, cmd):
-        if stop_event and stop_event.is_set():
+    def _worker(name, fetch):
+        if stop_event is not None and stop_event.is_set():
             return
-        _log(f'[{idx}/{total}] {name}...', 'terminal_red')
-        lines = run_command(cmd, stop_event=stop_event, show_cmd=False)
-        found = []
+        try:
+            raw = fetch()
+        except Exception as exc:
+            _log(f'  [{name}] failed: {exc}', 'default')
+            return
+        count = 0
         with lock:
-            for line in lines:
-                host = _extract_host(line)
-                if not host:
-                    continue
-                if _HOST_RE.match(host) and _is_subdomain(host, domain) and not _is_noise(host):
-                    if host not in raw_hosts:
-                        raw_hosts.add(host)
-                        found.append(host)
-        if found:
-            _log(f'  [{name}] +{len(found)} ({len(raw_hosts)} total)', 'light_green')
+            for entry in raw:
+                host = extract_host(str(entry))
+                if host and is_subdomain(host, domain) and validate_domain(host) and not is_noise(host):
+                    if host not in found:
+                        found.add(host)
+                        count += 1
+        _log(f'  [{name}] +{count}', 'default')
 
-    threads = [threading.Thread(target=_run_source, args=(i, name, cmd), daemon=True) for i, (name, cmd) in enumerate(sources, 1)]
+    threads = [threading.Thread(target=_worker, args=src, daemon=True) for src in sources]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
 
-    all_hosts = sorted(raw_hosts)
-    write_lines(os.path.join('results', 'all_subdomains.txt'), all_hosts)
-    _log(f'[+] Saved {len(all_hosts)} total discovered subdomains → results/all_subdomains.txt', 'light_green')
+    if stop_event is not None and stop_event.is_set():
+        _log('[-] Subdomain scan stopped.', 'red')
+        return
 
-    live_path = os.path.join('results', 'live_subdomains.txt')
-    final_path = os.path.join('results', 'subdomains.txt')
-    probe_json = os.path.join('results', 'meta', 'probe_results.json')
-    report_path = os.path.join('results', 'subdomain_report.txt')
-
+    all_hosts = sorted(found)
+    all_path = target_dir(domain, 'all_subdomains.txt')
+    live_path = target_dir(domain, 'subdomains.txt')
+    probe_path = target_dir(domain, 'meta', 'probe_results.json')
+    write_lines(all_path, all_hosts)
+    _log(f'[+] {len(all_hosts)} unique subdomains → {all_path}', 'light_green')
     if not all_hosts:
         write_lines(live_path, [])
-        write_lines(final_path, [])
-        write_lines(report_path, ['No subdomains were collected.'])
-        _log('[-] No subdomains collected. Check installed tools and network access.', 'red')
+        _log(f'[-] No subdomains found. Metadata: {meta_path}', 'red')
         return
 
-    _log(f'[*] Probing {len(all_hosts)} hosts with httpx...', 'default')
+    if not tool_exists(_HTTPX):
+        _log('[!] httpx (ProjectDiscovery) not found - using unprobed hosts. Run install.sh.', 'red')
+        write_lines(live_path, all_hosts)
+        return
 
-    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+    _log('[*] Probing live hosts with httpx...', 'stage')
+    hosts_file = None
+    probe = {}
     try:
-        for host in all_hosts:
-            tmp.write(host + '\n')
-        tmp.close()
-        live_lines = run_command(
-            f"{_HTTPX} -l {shlex.quote(tmp.name)} -status-code -title -follow-redirects -tech-detect -no-color -silent",
-            stop_event=stop_event,
-            show_cmd=False,
-        )
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False) as tmp:
+            tmp.write('\n'.join(all_hosts) + '\n')
+            hosts_file = tmp.name
+
+        def _probe_line(line):
+            parsed = parse_probe_line(line)
+            if not parsed:
+                return
+            origin, url, codes, title = parsed
+            host = extract_host(origin) or extract_host(url)
+            if not host or not is_subdomain(host, domain):
+                return
+            probe[host] = HostProbeResult(host, url, codes, title)
+
+        command = (f'{quote(_HTTPX)} -l {quote(hosts_file)} -json -status-code -title '
+                   f'-tech-detect -follow-redirects -silent -no-color')
+        result = stream_command(command, on_stdout=_probe_line, stop_event=stop_event, timeout=PROBE_TIMEOUT,
+                                on_stderr=lambda line: _log(f'  [httpx] {line}', 'default'))
     finally:
-        if os.path.exists(tmp.name):
-            os.unlink(tmp.name)
-
-    results = {}
-    for line in live_lines:
-        line = line.strip()
-        if not line:
-            continue
-        url_match = re.search(r'https?://\S+', line, re.IGNORECASE)
-        if not url_match:
-            continue
-        url = url_match.group(0)
-        host = _extract_host(url)
-        if not (_HOST_RE.match(host) and _is_subdomain(host, domain) and not _is_noise(host)):
-            continue
-        codes = tuple(sorted({int(code) for code in re.findall(r'\b(\d{3})\b', line)}))
-        if not set(codes).intersection(_ALLOWED_HTTP_CODES):
-            continue
-        title_match = re.search(r'\[([^\]]{1,200})\]\s*$', line)
-        title = title_match.group(1).strip() if title_match else ''
-        results[host] = HostProbeResult(host=host, url=url, codes=codes, title=title)
-
-    live_hosts = sorted(results.keys())
-    write_lines(live_path, live_hosts)
-    write_lines(final_path, live_hosts)
-
-    with open(probe_json, 'w', encoding='utf-8') as handle:
-        json.dump(
-            [
-                {
-                    'host': item.host,
-                    'url': item.url,
-                    'codes': list(item.codes),
-                    'title': item.title,
-                }
-                for item in sorted(results.values(), key=lambda x: x.host)
-            ],
-            handle,
-            indent=2,
-        )
-
-    report_lines = [
-        f'Target: {domain}',
-        f'Discovered hosts: {len(all_hosts)}',
-        f'Live hosts: {len(live_hosts)}',
-        '',
-        'Live host details:',
-    ]
-    for host in live_hosts:
-        item = results[host]
-        codes = ','.join(str(code) for code in item.codes)
-        title_part = f' | title={item.title}' if item.title else ''
-        report_lines.append(f'{host} | codes={codes} | url={item.url}{title_part}')
-    write_lines(report_path, report_lines)
-
-    if live_hosts:
-        _log(f'[+] {len(live_hosts)} live subdomains saved → {live_path}', 'light_green')
-        _log(f'[+] Structured probe data saved → {probe_json}', 'light_green')
-    else:
-        _log('[-] No live subdomains found for the allowed HTTP codes.', 'red')
-
-
-def read_subdomains():
-    return read_lines(os.path.join('results', 'subdomains.txt'))
-
-
-def to_url(host):
-    if host.startswith(('http://', 'https://')):
-        return host
-    return f'https://{host}'
-
-
-def directory_scan_ffuf(host, wordlist='common.txt', stop_event=None):
-    ensure_results_dirs()
-    try:
-        url = to_url(host)
-        sanitized = sanitize_filename(_extract_host(host))
-        out_dir = os.path.join('results', 'directory')
-        tmp_file = os.path.join(out_dir, f'{sanitized}_tmp.json')
-        final_file = os.path.join(out_dir, f'{sanitized}.txt')
-
-        if not os.path.exists(wordlist):
-            _log(f"[-] Wordlist '{wordlist}' not found.", 'red')
-            return
-
-        _log(f'[*] ffuf → {url}', 'default')
-        cmd = (
-            f"ffuf -w {shlex.quote(wordlist)} -u {shlex.quote(url.rstrip('/'))}/FUZZ "
-            f"-mc 200,204,301,302,307,308,401,403 -fc 404 -t 40 -timeout 8 "
-            f"-o {shlex.quote(tmp_file)} -of json -s"
-        )
-        run_command(cmd, stop_event=stop_event, show_cmd=False)
-
-        if not os.path.exists(tmp_file):
-            _log(f'[!] No ffuf output for {url}', 'red')
-            return
-
-        with open(tmp_file, encoding='utf-8', errors='ignore') as handle:
-            data = json.load(handle)
-        os.remove(tmp_file)
-
-        results = data.get('results', [])
-        if not results:
-            _log(f'[!] No interesting paths on {url}', 'default')
-            return
-
-        with open(final_file, 'w', encoding='utf-8') as handle:
-            handle.write(f'# FFUF Report: {url}\n\n')
-            for item in results:
-                handle.write(f"Status: {item.get('status')}\n")
-                handle.write(f"URL: {item.get('url')}\n")
-                handle.write(f"Length: {item.get('length')}\n")
-                handle.write(f"Words: {item.get('words')}\n")
-                handle.write(f"Lines: {item.get('lines')}\n")
-                handle.write(f"Content-Type: {item.get('content-type', '')}\n\n")
-        _log(f'[+] {len(results)} directory hits → {final_file}', 'light_green')
-    except Exception as exc:
-        _log(f'[-] Directory scan error for {host}: {exc}', 'red')
-
-
-def process_subdomains_for_scan(wordlist='common.txt', stop_event=None):
-    subdomains = read_subdomains()
-    if not subdomains:
-        _log('[-] No subdomains in results/subdomains.txt. Run subdomain scan first.', 'red')
-        return
-    _log(f'[*] Directory scan on {len(subdomains)} subdomains...', 'default')
-    for idx, host in enumerate(subdomains, 1):
-        if stop_event and stop_event.is_set():
-            _log('[-] Scan stopped.', 'red')
-            break
-        _log(f'--- [{idx}/{len(subdomains)}] ---', 'terminal_red')
-        directory_scan_ffuf(host, wordlist, stop_event)
-
-
-def run_paramspider(stop_event=None):
-    ensure_results_dirs()
-    subdomains = read_subdomains()
-    if not subdomains:
-        _log('[-] No subdomains in results/subdomains.txt. Run subdomain scan first.', 'red')
-        return
-
-    out_dir = os.path.join('results', 'paramspider')
-    total_params = 0
-
-    for idx, host in enumerate(subdomains, 1):
-        if stop_event and stop_event.is_set():
-            _log('[-] Scan stopped.', 'red')
-            break
-
-        domain = _extract_host(host)
-        _log(f'[{idx}/{len(subdomains)}] ParamSpider → {domain}', 'default')
-        process = subprocess.Popen(
-            f'paramspider -d {shlex.quote(domain)}',
-            shell=True,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
-        )
-        try:
-            stdout, _ = process.communicate(timeout=150)
-        except subprocess.TimeoutExpired:
-            _kill_process(process)
-            _log(f'[!] ParamSpider timeout for {domain}', 'red')
-            continue
-
-        stdout = stdout or ''
-        if stdout.strip():
-            _log(clean_output(stdout), 'default')
-
-        hits = []
-        default_result = os.path.join('results', f'{domain}.txt')
-        if os.path.exists(default_result):
-            hits = read_lines(default_result)
+        if hosts_file:
             try:
-                os.remove(default_result)
+                os.remove(hosts_file)
             except OSError:
                 pass
-        if not hits:
-            hits = [line.strip() for line in stdout.splitlines() if line.strip().startswith(('http://', 'https://')) and '=' in line]
 
-        hits = sorted(set(hits))
-        if hits:
-            total_params += len(hits)
-            out_file = os.path.join(out_dir, f'{sanitize_filename(domain)}.txt')
-            write_lines(out_file, hits)
-            _log(f'[+] {len(hits)} params → {out_file}', 'light_green')
-        else:
-            _log(f'[!] No params for {domain}', 'default')
+    if result.stopped:
+        _log('[-] Probe stopped.', 'red')
+        return
+    if result.timed_out:
+        _log('[!] httpx timed out; using partial results.', 'red')
 
-    _log(f'[+] ParamSpider completed. Total params: {total_params}', 'light_green')
+    live = sorted(host for host, res in probe.items() if res.is_live)
+    write_lines(live_path, live)
+    with open(probe_path, 'w', encoding='utf-8') as handle:
+        json.dump([{'host': r.host, 'url': r.url, 'codes': list(r.codes), 'title': r.title}
+                   for r in probe.values()], handle, indent=2)
+    for host in live:
+        res = probe[host]
+        _log(f'  {host} [{res.primary_code}] {res.title}', 'default')
+    _log(f'[+] {len(live)} live subdomains → {live_path}', 'light_green')
 
 
+# --------------------------------------------------------------------------
+# Directory brute force (ffuf)
+# --------------------------------------------------------------------------
+def directory_scan_ffuf(domain, host, wordlist, stop_event=None, probe_urls=None):
+    out_dir = target_dir(domain, 'directory')
+    os.makedirs(out_dir, exist_ok=True)
+    base = base_url_for(domain, host, probe_urls)
+    tmp_file = os.path.join(out_dir, f'.{host}.tmp.json')
+    final_file = os.path.join(out_dir, f'{host}.txt')
+    # -ac auto-calibrates against wildcard / soft-404 / blanket-403 hosts
+    command = (f'ffuf -w {quote(wordlist)} -u {quote(base + "/FUZZ")} '
+               f'-mc 200,204,301,302,307,308,401,403 -ac -t {FFUF_THREADS} -rate {FFUF_RATE} '
+               f'-timeout 8 -o {quote(tmp_file)} -of json -s')
+    _log(f'[*] ffuf → {base}', 'stage')
+    try:
+        result = stream_command(command, on_stdout=lambda line: _log(line, 'default'),
+                                on_stderr=lambda line: _log(f'  [ffuf] {line}', 'default'),
+                                stop_event=stop_event, timeout=FFUF_HOST_TIMEOUT)
+        if result.stopped:
+            return
+        if result.timed_out:
+            _log(f'[!] ffuf timed out on {host}', 'red')
+        if not os.path.exists(tmp_file):
+            return
+        with open(tmp_file, encoding='utf-8') as handle:
+            data = json.load(handle)
+        rows = data.get('results', [])
+        if not rows:
+            return
+        with open(final_file, 'w', encoding='utf-8') as handle:
+            handle.write(f'# FFUF Report: {host}\n\n')
+            for item in rows:
+                handle.write(f"Status: {item.get('status')}\nURL: {item.get('url')}\n\n")
+        _log(f'[+] {len(rows)} hits → {final_file}', 'light_green')
+    except (OSError, ValueError) as exc:
+        _log(f'[-] ffuf result error for {host}: {exc}', 'red')
+    finally:
+        try:
+            os.remove(tmp_file)
+        except OSError:
+            pass
+
+
+def process_subdomains_for_scan(domain, wordlist='common.txt', stop_event=None):
+    domain = normalize_domain(domain)
+    ensure_results_dirs(domain)
+    reset_dir(target_dir(domain, 'directory'))
+    hosts = read_lines(target_dir(domain, 'subdomains.txt'))
+    if not hosts:
+        _log(f'[-] No subdomains for {domain}. Run the subdomain scan first.', 'red')
+        return
+    wordlist = resolve_path(wordlist)
+    if not os.path.isfile(wordlist):
+        _log(f'[-] Wordlist not found: {wordlist}', 'red')
+        return
+    if not tool_exists('ffuf'):
+        _log('[-] ffuf is not installed.', 'red')
+        return
+    probe = load_probe_urls(domain)
+    _log(f'[*] Directory scan on {len(hosts)} hosts...', 'stage')
+    for host in hosts:
+        if stop_event is not None and stop_event.is_set():
+            _log('[-] Directory scan stopped.', 'red')
+            return
+        directory_scan_ffuf(domain, host, wordlist, stop_event, probe)
+    _log('[+] Directory scan complete.', 'light_green')
+
+
+# --------------------------------------------------------------------------
+# ParamSpider
+# --------------------------------------------------------------------------
+def run_paramspider(domain, stop_event=None):
+    domain = normalize_domain(domain)
+    ensure_results_dirs(domain)
+    out_dir = target_dir(domain, 'paramspider')
+    reset_dir(out_dir)
+    hosts = read_lines(target_dir(domain, 'subdomains.txt'))
+    if not hosts:
+        _log(f'[-] No subdomains for {domain}. Run the subdomain scan first.', 'red')
+        return
+    if not tool_exists('paramspider'):
+        _log('[-] paramspider is not installed.', 'red')
+        return
+    _log(f'[*] ParamSpider on {len(hosts)} hosts...', 'stage')
+    total = 0
+    for host in hosts:
+        if stop_event is not None and stop_event.is_set():
+            _log('[-] ParamSpider stopped.', 'red')
+            return
+        urls = []
+        # Run in a scratch dir: ParamSpider writes results/<host>.txt relative to cwd.
+        with tempfile.TemporaryDirectory() as scratch:
+            result = stream_command(f'paramspider -d {quote(host)}', on_stdout=urls.append,
+                                    stop_event=stop_event, timeout=PARAMSPIDER_TIMEOUT, cwd=scratch)
+            if result.stopped:
+                _log('[-] ParamSpider stopped.', 'red')
+                return
+            if result.timed_out:
+                _log(f'[!] ParamSpider timed out on {host}', 'red')
+            for rel in (os.path.join('results', f'{host}.txt'), os.path.join('output', f'{host}.txt'), f'{host}.txt'):
+                path = os.path.join(scratch, rel)
+                if os.path.exists(path):
+                    urls.extend(read_lines(path))
+        urls = sorted({u for u in urls if u.startswith(('http://', 'https://')) and '=' in u})
+        if urls:
+            write_lines(os.path.join(out_dir, f'{host}.txt'), urls)
+            total += len(urls)
+            _log(f'  {host}: {len(urls)} parameterised URLs', 'default')
+    _log(f'[+] ParamSpider complete: {total} URLs → {out_dir}', 'light_green')
+
+
+# --------------------------------------------------------------------------
+# Final report
+# --------------------------------------------------------------------------
 def generate_final_report(domain):
-    ensure_results_dirs()
-    report_path = os.path.join('results', 'FINAL_REPORT.txt')
+    domain = normalize_domain(domain)
+    report = target_dir(domain, 'FINAL_REPORT.txt')
     sections = [
-        'Bug Hunter Final Report',
-        '=' * 60,
-        f'Target: {domain}',
-        f'Generated: {datetime.utcnow().isoformat()}Z',
-        '',
+        ('SUBDOMAINS (live)', [target_dir(domain, 'subdomains.txt')]),
+        ('DIRECTORY SCAN', [os.path.join(target_dir(domain, 'directory'), f)
+                            for f in sorted(os.listdir(target_dir(domain, 'directory')))
+                            if f.endswith('.txt')] if os.path.isdir(target_dir(domain, 'directory')) else []),
+        ('PARAMSPIDER', [os.path.join(target_dir(domain, 'paramspider'), f)
+                         for f in sorted(os.listdir(target_dir(domain, 'paramspider')))
+                         if f.endswith('.txt')] if os.path.isdir(target_dir(domain, 'paramspider')) else []),
+        ('XSS - KXSS', [target_dir(domain, 'xss', 'kxss.txt')]),
+        ('XSS - REFLECTED PARAMETERS (candidates, not confirmed)', [target_dir(domain, 'xss', 'reflection.txt')]),
+        ('NUCLEI', [target_dir(domain, 'nuclei', 'nuclei.txt')]),
     ]
-
-    subs = read_subdomains()
-    sections += ['Subdomains', '-' * 60, *subs, ''] if subs else ['Subdomains', '-' * 60, 'No live subdomains found.', '']
-
-    dir_dir = os.path.join('results', 'directory')
-    if os.path.isdir(dir_dir):
-        sections += ['Directory Findings', '-' * 60]
-        files = sorted(f for f in os.listdir(dir_dir) if f.endswith('.txt'))
-        if files:
-            for name in files:
-                sections += [f'## {name}'] + read_lines(os.path.join(dir_dir, name)) + ['']
-        else:
-            sections += ['No directory findings.', '']
-
-    ps_dir = os.path.join('results', 'paramspider')
-    if os.path.isdir(ps_dir):
-        sections += ['Parameters', '-' * 60]
-        files = sorted(f for f in os.listdir(ps_dir) if f.endswith('.txt'))
-        if files:
-            for name in files:
-                lines = read_lines(os.path.join(ps_dir, name))
-                sections.append(f'{name}: {len(lines)} parameters')
-                sections.extend(lines[:50])
-                if len(lines) > 50:
-                    sections.append(f'... and {len(lines) - 50} more')
-                sections.append('')
-        else:
-            sections += ['No parameter results.', '']
-
-    for label, path in [
-        ('XSS - KXSS', os.path.join('results', 'xss', 'kxss.txt')),
-        ('XSS - QSReplace', os.path.join('results', 'xss', 'qsreplace.txt')),
-        ('Nuclei', os.path.join('results', 'nuclei', 'nuclei.txt')),
-    ]:
-        sections += [label, '-' * 60]
-        lines = read_lines(path)
-        sections += lines if lines else ['No findings.']
-        sections.append('')
-
-    write_lines(report_path, sections)
-    _log(f'[+] Final report generated → {report_path}', 'light_green')
+    with open(report, 'w', encoding='utf-8') as handle:
+        handle.write(f'FINAL REPORT: {domain}\nGenerated: {datetime.now(timezone.utc).isoformat()}\n\n')
+        for title, paths in sections:
+            handle.write(f'===== {title} =====\n')
+            wrote = False
+            for path in paths:
+                lines = read_lines(path, keep_blank=True)
+                if any(line.strip() for line in lines):
+                    handle.write('\n'.join(lines).rstrip() + '\n')
+                    wrote = True
+            if not wrote:
+                handle.write('(no results)\n')
+            handle.write('\n')
+    _log(f'[+] Final report → {report}', 'light_green')
 
 
-def _run_threaded(fn, stop_event, status_var, all_btns, start_btn, stop_btn, label, root, *args):
+# --------------------------------------------------------------------------
+# Threading wrappers
+# --------------------------------------------------------------------------
+def _run_threaded(fn, stop_event, status_var, all_btns, stop_btn, label, root, *args):
     stop_event.clear()
+    status_var.set(f'Running: {label}...')
     for button in all_btns:
         button.config(state='disabled')
     stop_btn.config(state='normal')
-    status_var.set(label)
 
-    def _restore(final_status='Ready'):
+    def _restore(final):
         for button in all_btns:
             button.config(state='normal')
         stop_btn.config(state='disabled')
-        status_var.set(final_status)
+        status_var.set(final)
 
     def _run():
-        final_status = 'Ready'
+        final = 'Ready'
         try:
             fn(*args, stop_event=stop_event)
+            if stop_event.is_set():
+                final = 'Stopped'
         except Exception as exc:
-            final_status = f'Error: {exc}'
+            final = f'Error: {exc}'
+            _log(f'[-] {exc}', 'red')
         finally:
-            root.after(0, _restore, final_status)
+            root.after(0, _restore, final)
 
     threading.Thread(target=_run, daemon=True).start()
 
 
-def start_full_scan(domain, wordlist, stop_event, status_var, all_btns, start_btn, stop_btn, root):
-    if not validate_domain(domain):
-        messagebox.showerror('Invalid Domain', f"'{domain}' is not a valid domain.\nExample: example.com")
+def start_full_scan(domain, wordlist, stop_event, status_var, all_btns, stop_btn, root):
+    domain = _validated(domain)
+    if not domain:
         return
 
-    def run_all(stop_event):
-        _log('=' * 60, 'terminal_red')
-        _log(f'[>] Full scan started: {domain}', 'light_green')
-        _log('=' * 60, 'terminal_red')
-        _log('[1/5] Subdomain enumeration', 'light_green')
-        fetch_subdomains(domain, stop_event)
-        if stop_event.is_set():
+    def _full(stop_event=None):
+        def stopped():
+            return stop_event.is_set()
+        _log(f'=== Full scan: {domain} ===', 'stage')
+        fetch_subdomains(domain, stop_event=stop_event)
+        if stopped():
             return
-        _log('[2/5] Parameter discovery', 'light_green')
-        run_paramspider(stop_event)
-        if stop_event.is_set():
+        process_subdomains_for_scan(domain, wordlist, stop_event=stop_event)
+        if stopped():
             return
-        _log('[3/5] Content discovery', 'light_green')
-        process_subdomains_for_scan(wordlist, stop_event)
-        if stop_event.is_set():
+        run_paramspider(domain, stop_event=stop_event)
+        if stopped():
             return
-        _log('[4/5] XSS workflow', 'light_green')
         xss.run_xss_scan(domain, _log, stop_event)
-        if stop_event.is_set():
+        if stopped():
             return
-        _log('[5/5] Nuclei workflow', 'light_green')
         run_nuclei_scan(domain, _log, stop_event)
-        if stop_event.is_set():
+        if stopped():
             return
         generate_final_report(domain)
-        _log('[✓] Full scan complete.', 'light_green')
+        _log('=== Full scan complete ===', 'light_green')
 
-    _run_threaded(run_all, stop_event, status_var, all_btns, start_btn, stop_btn, f'Full scan: {domain}', root)
+    _run_threaded(_full, stop_event, status_var, all_btns, stop_btn, 'Full Scan', root)
 
 
-def start_subdomain_scan(domain, stop_event, status_var, all_btns, start_btn, stop_btn, root):
-    if not validate_domain(domain):
-        messagebox.showerror('Invalid Domain', f"'{domain}' is not a valid domain.\nExample: example.com")
+def start_subdomain_scan(domain, stop_event, status_var, all_btns, stop_btn, root):
+    domain = _validated(domain)
+    if domain:
+        _run_threaded(fetch_subdomains, stop_event, status_var, all_btns, stop_btn, 'Subdomains', root, domain)
+
+
+def start_directory_scan(domain, wordlist, stop_event, status_var, all_btns, stop_btn, root):
+    domain = _validated(domain)
+    if domain:
+        _run_threaded(process_subdomains_for_scan, stop_event, status_var, all_btns, stop_btn, 'Directory', root, domain, wordlist)
+
+
+def start_paramspider(domain, stop_event, status_var, all_btns, stop_btn, root):
+    domain = _validated(domain)
+    if domain:
+        _run_threaded(run_paramspider, stop_event, status_var, all_btns, stop_btn, 'ParamSpider', root, domain)
+
+
+def start_xss_scan(domain, stop_event, status_var, all_btns, stop_btn, root):
+    domain = _validated(domain)
+    if not domain:
         return
-    _run_threaded(fetch_subdomains, stop_event, status_var, all_btns, start_btn, stop_btn, f'Subdomain scan: {domain}', root, domain)
 
-
-def start_directory_scan(wordlist, stop_event, status_var, all_btns, start_btn, stop_btn, root):
-    _run_threaded(process_subdomains_for_scan, stop_event, status_var, all_btns, start_btn, stop_btn, 'Directory scan...', root, wordlist)
-
-
-def start_paramspider(stop_event, status_var, all_btns, start_btn, stop_btn, root):
-    _run_threaded(run_paramspider, stop_event, status_var, all_btns, start_btn, stop_btn, 'ParamSpider...', root)
-
-
-def start_xss_scan(domain, stop_event, status_var, all_btns, start_btn, stop_btn, root):
-    if not validate_domain(domain):
-        messagebox.showerror('Invalid Domain', f"'{domain}' is not a valid domain.\nExample: example.com")
-        return
-
-    def _xss(stop_event):
+    def _xss(stop_event=None):
         xss.run_xss_scan(domain, _log, stop_event)
 
-    _run_threaded(_xss, stop_event, status_var, all_btns, start_btn, stop_btn, f'XSS scan: {domain}', root)
+    _run_threaded(_xss, stop_event, status_var, all_btns, stop_btn, 'XSS', root)
 
 
-def start_nuclei_scan(domain, stop_event, status_var, all_btns, start_btn, stop_btn, root):
-    if not validate_domain(domain):
-        messagebox.showerror('Invalid Domain', f"'{domain}' is not a valid domain.\nExample: example.com")
+def start_nuclei_scan(domain, stop_event, status_var, all_btns, stop_btn, root):
+    domain = _validated(domain)
+    if not domain:
         return
 
-    def _nuclei(stop_event):
+    def _nuclei(stop_event=None):
         run_nuclei_scan(domain, _log, stop_event)
 
-    _run_threaded(_nuclei, stop_event, status_var, all_btns, start_btn, stop_btn, f'Nuclei scan: {domain}', root)
+    _run_threaded(_nuclei, stop_event, status_var, all_btns, stop_btn, 'Nuclei', root)
 
 
 def main():
@@ -675,7 +544,7 @@ def main():
     header_frame.pack(pady=(20, 10))
 
     try:
-        logo_image = Image.open('13.png')
+        logo_image = Image.open(os.path.join(BASE_DIR, '13.png'))
         logo_image = logo_image.resize((80, 80), Image.LANCZOS)
         logo_photo = ImageTk.PhotoImage(logo_image)
         logo_label = tk.Label(header_frame, image=logo_photo, bg='#1E1E2E')
@@ -769,7 +638,7 @@ def main():
         bd=5,
     )
     output_text.pack(pady=15, padx=20)
-    output_text.tag_configure('terminal_red', foreground='#00FF00')
+    output_text.tag_configure('stage', foreground='#00FF00')
     output_text.tag_configure('default', foreground='#FFFFFF')
     output_text.tag_configure('light_green', foreground='#00FF00')
     output_text.tag_configure('red', foreground='#FF0000')
@@ -829,12 +698,12 @@ def main():
         return wordlist_var.get()
 
     def _args(**kw):
-        return dict(stop_event=stop_event, status_var=status_var, all_btns=all_btns, start_btn=start_btn, stop_btn=stop_btn, root=root, **kw)
+        return dict(stop_event=stop_event, status_var=status_var, all_btns=all_btns, stop_btn=stop_btn, root=root, **kw)
 
     start_btn.config(command=lambda: start_full_scan(_d(), _wl(), **_args()))
     btn_sub.config(command=lambda: start_subdomain_scan(_d(), **_args()))
-    btn_dir.config(command=lambda: start_directory_scan(_wl(), **_args()))
-    btn_para.config(command=lambda: start_paramspider(**_args()))
+    btn_dir.config(command=lambda: start_directory_scan(_d(), _wl(), **_args()))
+    btn_para.config(command=lambda: start_paramspider(_d(), **_args()))
     btn_xss.config(command=lambda: start_xss_scan(_d(), **_args()))
     btn_nuc.config(command=lambda: start_nuclei_scan(_d(), **_args()))
 
