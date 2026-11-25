@@ -63,9 +63,10 @@
    Set-ExecutionPolicy -Scope Process Bypass
    .\install.ps1
    ```
-4. Manually install (if the script reports them missing):
-   - **ffuf**: download the Windows zip from [ffuf releases](https://github.com/ffuf/ffuf/releases) and put `ffuf.exe` on your PATH.
-   - **ParamSpider**: `pip install paramspider`
+   The installer will install Pillow and try to install ParamSpider automatically.
+4. If `ffuf` is still missing after the script finishes:
+   - Download `ffuf_windows_amd64.zip` from [ffuf releases](https://github.com/ffuf/ffuf/releases)
+   - Extract `ffuf.exe` and place it somewhere on your PATH (or next to `bug.py`).
 5. Run:
    ```powershell
    python bug.py

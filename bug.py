@@ -13,6 +13,33 @@ from urllib.parse import quote as url_quote
 
 from PIL import Image, ImageTk
 
+# Friendly startup check (especially useful on Windows)
+def _check_gui_deps():
+    missing = []
+    try:
+        import tkinter
+    except ImportError:
+        missing.append('tkinter (re-run the Python installer and select "tcl/tk and IDLE")')
+    try:
+        from PIL import Image
+    except ImportError:
+        missing.append('Pillow (run: pip install -r requirements.txt)')
+    if missing:
+        msg = "Missing required GUI dependencies:\n\n" + "\n".join(f"- {m}" for m in missing)
+        print(msg)
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showerror("Bug Hunter - Missing Dependencies", msg)
+            root.destroy()
+        except Exception:
+            pass
+        raise SystemExit(1)
+
+_check_gui_deps()
+
 import xss
 from core import (
     BASE_DIR,

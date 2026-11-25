@@ -27,11 +27,19 @@ try {
     Write-Host "[!] tkinter is missing. Re-run the Python installer and select 'tcl/tk and IDLE'." -ForegroundColor Yellow
 }
 
-# Pillow
-Write-Host "[*] Installing Python dependencies (Pillow)..."
+# Pillow + ParamSpider
+Write-Host "[*] Installing Python dependencies (Pillow + ParamSpider)..."
 & $py.Source -m pip install -r (Join-Path $ScriptDir "requirements.txt")
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "[!] pip install failed. Try running as Administrator or use a virtualenv." -ForegroundColor Yellow
+    Write-Host "[!] pip install of requirements failed." -ForegroundColor Yellow
+}
+# Try to install ParamSpider as well
+Write-Host "    Attempting: pip install paramspider"
+& $py.Source -m pip install paramspider
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "    ParamSpider installed via pip" -ForegroundColor Green
+} else {
+    Write-Host "[!] ParamSpider pip install failed (you can still install it later)." -ForegroundColor Yellow
 }
 
 # Go tools
@@ -56,30 +64,31 @@ if (-not $go) {
     }
     $gobin = Join-Path $env:USERPROFILE "go\bin"
     if ($env:PATH -notlike "*$gobin*") {
-        Write-Host "[!] Add Go binaries to PATH:" -ForegroundColor Yellow
-        Write-Host "    `$env:PATH += `\";$gobin`\"" -ForegroundColor Yellow
-        Write-Host "    (or add $gobin permanently via System Properties > Environment Variables)" -ForegroundColor Yellow
+        Write-Host "[!] Add Go binaries to PATH (current session):" -ForegroundColor Yellow
+        Write-Host "    `$env:PATH += `";$gobin`"" -ForegroundColor Yellow
+        Write-Host "    To make it permanent: System Properties > Environment Variables > Path" -ForegroundColor Yellow
+        # Offer to add for current session
+        $env:PATH += ";$gobin"
+        Write-Host "    (added to current session PATH)" -ForegroundColor Green
     } else {
         Write-Host "    Go bin already in PATH" -ForegroundColor Green
     }
 }
 
 # Manual tools reminder
-Write-Host "[*] Checking optional / manual tools..."
+Write-Host "[*] Checking remaining tools..."
 foreach ($tool in @("ffuf", "paramspider", "findomain", "amass")) {
     $found = Get-Command $tool -ErrorAction SilentlyContinue
     if ($found) {
         Write-Host "    [ok] $tool" -ForegroundColor Green
     } else {
-        Write-Host "    [missing] $tool - install manually" -ForegroundColor Yellow
+        Write-Host "    [missing] $tool" -ForegroundColor Yellow
     }
 }
 
 Write-Host ""
-Write-Host "Manual install hints (Windows):" -ForegroundColor Cyan
-Write-Host "  ffuf:        https://github.com/ffuf/ffuf/releases  (download ffuf_windows_amd64.zip)" -ForegroundColor White
-Write-Host "  ParamSpider: pip install paramspider" -ForegroundColor White
-Write-Host "  findomain:   https://github.com/findomain/findomain/releases" -ForegroundColor White
-Write-Host "  amass:       https://github.com/owasp-amass/amass/releases" -ForegroundColor White
+Write-Host "If ffuf is still missing:" -ForegroundColor Cyan
+Write-Host "  1. Download ffuf_windows_amd64.zip from https://github.com/ffuf/ffuf/releases" -ForegroundColor White
+Write-Host "  2. Extract ffuf.exe somewhere on your PATH (or into the folder with bug.py)" -ForegroundColor White
 Write-Host ""
 Write-Host "[+] Done. Run:  python bug.py" -ForegroundColor Green
